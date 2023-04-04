@@ -1,0 +1,14 @@
+yelp_final codebook
+
+business_id, type str, is a unique identifier for individual restaurants
+
+all features that begin with "categories_", type num, are dummy coded variables representing individual categories, with 1 representing that the obs has that tag
+and 0 representing that the obs doesn't have that tag
+
+stars, type num, is the star rating of the restaurant.
+
+state, type chr, is the state the restaurant is in.
+
+review_count is the number of reviews the restaurant has. 
+
+The original dataset was multiple gigabytes worth of data so I will not be including it. I will however be including my final dataset.

@@ -1,0 +1,244 @@
+---
+title: "Final Project Proposal"
+author: "Dylan Fu"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    code_folding: "hide"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyr)
+library(stringr)
+library(tidymodels)
+library(tidyverse)
+library(glmnet)
+library(modeldata)
+library(kknn)
+library(janitor)
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores())
+library(vip)
+library(ggplot2)
+library(fastDummies)
+library(kableExtra)
+#pretty table func
+kable <- function(data, scroll=TRUE) {
+    knitr::kable(data, booktabs = TRUE) |>
+    kable_styling(full_width=TRUE, latex_options = c("striped", "scale_down")) |>
+    (\(.) if (scroll) scroll_box(., height = "200px") else .)()
+}
+```
+
+# Introduction
+
+The dataset that I'll be using for my final project is Yelp's restaurant dataset. (found at [Yelp Dataset](https://www.yelp.com/dataset/documentation/main)) It has over 150,000 observations and 15 predictors, with both quantitative and qualitative predictors. There are no missing (NA) values in the dataset.
+
+```{r}
+yelp_businesses<-read.csv('C:/Users/Dylan Fu/Desktop/file.csv')
+```
+
+```{r}
+nrow(yelp_businesses)
+sum(is.na(yelp_businesses))
+sapply(yelp_businesses, class)
+```
+
+# Research Question
+
+My question is, "Can I build a machine learning model to predict the Yelp score of a restaurant?"
+
+The variable I'm interested in predicting is stars, Yelp's aggregate review score out of a maximum of 5. I want to see if I can predict a restaurant's rating based on other variables such as location, price, etc. This problem is best approached as a regression task, as my response variable is numeric. I believe that predictors such as "attributes", "categories" and "review count" will be particularly helpful. The goal of my model is both predictive and inferential. I want to be able to predict a restaurant's score and learn what attributes may influence score.
+
+# Cleaning the Data
+
+First, I excluded non-restaurant/food related observations by filtering on the word "Food" to remove non-restaurant observations. Then I filtered on is_open and review_count to exude observations with fewer than 30 reviews and restaurants that had closed down.
+
+```{r}
+
+yelp_res<-yelp_businesses%>%filter(str_detect(yelp_businesses$categories, pattern = 'Food'))%>%filter(is_open == 1)%>%filter(review_count>=30)
+```
+
+Then, I used separate_rows() to split the strings in `categories` into multiple observations with one tag per row. Then I lumped together tags rarer than the top 70 into an `Other` tag and also dummy coded the remaining categories.
+
+```{r}
+yelp_sep<-separate_rows(yelp_res,categories)
+yelp_sep$categories<-yelp_sep$categories%>%fct_lump_n(80)%>%fct_lump
+yelp_dum<-dummy_cols(.data = yelp_sep, select_columns = 'categories', remove_selected_columns = T)
+```
+
+Finally, I excluded duplicate rows and merged together rows to create unique rows with all dummy coded variables as well as filtering on `categories_Restaurant` to filter out any remaining non-restaurants.
+
+```{r}
+yelp_dum<-unique(yelp_dum)
+yelp_final<-yelp_dum%>%group_by(business_id)%>%summarise(across(categories_American:categories_Other,sum))
+yelp_final<-yelp_final%>%filter(categories_Restaurants == 1)
+yelp_final<-left_join(yelp_final, distinct(yelp_dum%>%select(business_id, stars,state, review_count)))
+yelp_final<-yelp_final%>%mutate(across(contains("categories"),as.double))
+```
+
+# Exploratory Data Analysis
+
+Review scores are not uniformly distributed, most scores lie within the 3.5 to 4.5 range.
+
+```{r}
+ggplot(yelp_final,aes(stars))+geom_bar()
+```
+
+Review counts are potentially higher for star ratings between 3-5 and 5 while median stars for restaurants in different states does not seem to be significantly different. Review counts in certain states like California and Louisiana seem to be different.
+
+```{r}
+ggplot(yelp_final, aes(stars, group= stars ,review_count))+geom_boxplot()
+ggplot(yelp_final, aes(state, stars))+geom_boxplot()
+ggplot(yelp_final, aes(state, review_count))+geom_boxplot()
+```
+
+# Creating Models
+
+## Splitting Data
+
+I split my data into train/test splits with a ratio of .7 while stratifying on `stars` to account for the fact that there are far fewer restaurants with extreme star ratings. Then, I split my training set into a further 10 folds, also stratified by `stars`. Cross validation allows me to predict generally how my models will perform on the testing set without causing data leakage by actually applying them to the testing set.
+
+```{r}
+df_rating<-yelp_final%>%select(!c(business_id, categories_Restaurants, categories_Food))
+df_rating<-clean_names(df_rating)
+df_split<-initial_split(df_rating, prop=.7, strata = stars)
+df_train<-training(df_split)
+df_fold<-vfold_cv(df_train, v = 10, strata = stars)
+df_test<-testing(df_split)
+```
+
+## Creating Recipe
+
+```{r}
+df_rec<-recipe(stars~., data=df_train)%>%step_dummy(state)
+```
+
+## Building Models
+
+I set up models, workflows and grids for linear regression, elastic net regression, k-nearest neighbors, and random forest machine learning models.
+
+```{r}
+#LINEAR REGRESSION
+lm_model<-linear_reg()%>%set_engine("lm")
+lm_wk<-workflow()%>%add_model(lm_model)%>%add_recipe(df_rec)
+
+#K-NEAREST NEIGHBORS
+kn_model<-nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>% set_mode("regression")
+kn_wk<-workflow()%>%add_model(kn_model)%>%add_recipe(df_rec)
+
+#ELASTIC NET
+glm_model<- linear_reg(mixture = tune(), penalty = tune()) %>%set_mode("regression")%>%set_engine("glmnet")
+glm_wk<-workflow()%>%add_model(glm_model)%>%add_recipe(df_rec)
+# RANDOM FOREST
+
+rf_model <- rand_forest(mtry = tune(), 
+                       trees = tune(), 
+                       min_n = tune()) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+rf_wk<-workflow()%>%add_model(rf_model)%>%add_recipe(df_rec)
+```
+
+## Create Tuning Grids
+
+The hyperparameter ranges that I chose were based on my understanding of my computer's ability to run the tuning in a timely fashion. Random forest had mtry between 1 and 20, trees between 200 and 1000, and min_n between 5 and 20. K-nearest neighbors had neighbors between 1 and 20, and Elastic Net was tuned as usual.
+
+```{r}
+# RANDOM FOREST
+rf_grid<- grid_regular(mtry(range = c(1, 20)), trees(range = c(200,1000)), min_n(range = c(5,20)), levels = 20)
+#K-NEAREST NEIGHBORS
+ykn_grid<- grid_regular(neighbors(range = c(1, 20)), levels=20)
+#ELASTIC NET REGRESSION
+glm_grid <- grid_regular(penalty(range = c(0, 1),
+                                     trans = identity_trans()),
+                        mixture(range = c(0, 1)),
+                             levels = 10)
+```
+
+## Fitting Models
+
+I then fit models onto the CV set using `tune_grid()`, saving my results for comparison later on.
+
+```{r}
+# LINEAR REGRESSION
+lm_fit <- fit_resamples(lm_wk, resamples = df_fold)
+lm_metrics <- collect_metrics(lm_fit)
+```
+
+```{r}
+tune_kn_grid<-tune_grid(kn_wk, resamples = df_fold, grid=ykn_grid)
+best_kn<-select_best(tune_kn_grid, metric = "rmse", neighbors)
+kn_wk_train<-finalize_workflow(kn_wk, best_kn)
+kn_final_fit<-fit_resamples(kn_wk_train, resamples = df_fold)
+kn_metrics<-collect_metrics(kn_final_fit)
+```
+
+```{r}
+tune_glm_grid<-tune_grid(glm_wk, resamples = df_fold, grid = glm_grid)
+best_glm<-select_best(tune_glm_grid, metric = 'rmse', penalty, mixture)
+glm_wk_train<-finalize_workflow(glm_wk, best_glm)
+glm_final_fit<-fit_resamples(glm_wk_train, resamples = df_fold)
+glm_metrics<-collect_metrics(glm_final_fit)
+```
+
+```{r, eval = F}
+rf_tune_grid <- tune_grid(
+  rf_wk,
+  resamples = df_fold,
+  grid = rf_grid, control = control_grid(verbose = TRUE)
+)
+save(rf_tune_grid, file='rf_tune_grid.rda')
+```
+
+```{r}
+load('rf_tune_grid.rda')
+best_rf<-select_best(rf_tune_grid, metric = "rmse", mtry, trees, min_n)
+rf_wk_train<-finalize_workflow(rf_wk, best_rf)
+rf_final_fit<-fit_resamples(rf_wk_train, resamples = df_fold)
+rf_metrics<-collect_metrics(rf_final_fit)
+```
+
+## Comparing Models
+
+In regards to the CV set, Random Forest was the most successful model. The hyperparameters which gave the best performance were to select from 8 predictors, to have 542 trees, and minimum n of 5.
+
+```{r}
+final_compare_tibble <- tibble(Model = c("Linear Regression", "K Nearest Neighbors" ,"Elastic Net", "Random Forest"), RMSE = c(lm_metrics$mean[1],kn_metrics$mean[1], glm_metrics$mean[1], rf_metrics$mean[1]))
+final_compare_tibble <- final_compare_tibble %>% 
+  arrange(RMSE)
+final_compare_tibble%>%kable()
+```
+
+```{r}
+autoplot(rf_tune_grid, metric = "rmse")
+autoplot(tune_kn_grid, metric = "rmse")
+autoplot(tune_glm_grid, metric = "rmse")
+```
+
+## Fitting on Testing Set
+
+The random forest model had similar performance on the testing set as it had on the training and CV sets.
+
+```{r}
+rf_final_fit<-fit(rf_wk_train, df_train)
+aug_test<-augment(rf_final_fit, df_test)
+multi_metric<-metric_set(rmse,rsq,mae)
+multi_metric(aug_test, stars, .pred)
+```
+
+# Conclusion
+
+To conclude my analysis, I fitted the best performing model, Random Forest, to the testing set, garnering an R2 of 0.55 and a RMSE of .56, meaning my model accounts for 55% of the variation in `stars` with a root mean difference between actual `stars` and predicted `stars` of .56. While these results are not ideal, some of the unexplained variation can be attributed to the fact that star ratings are an expression of human behavior, making it inherently harder to predict objectively. One thing I didn't expect was for categories like 'Fast' and 'Burgers' to be so important while other variables like 'State' were much less impactful.
+
+```{r echo=FALSE}
+rf_final_fit%>% 
+  extract_fit_engine() %>% 
+  vip(aesthetics = list(fill = "grey"))
+```
